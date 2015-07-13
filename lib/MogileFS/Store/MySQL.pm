@@ -29,12 +29,44 @@ sub init {
     $self->SUPER::init;
     $self->{lock_depth} = 0;
     $self->{slave_next_check} = 0;
+    $self->{__lock_obj} = {};
 }
 
 sub post_dbi_connect {
     my $self = shift;
     $self->SUPER::post_dbi_connect;
     $self->{lock_depth} = 0;
+
+    my $dbh = $self->dbh;
+    my $errmsg =
+        "InnoDB backend is unavailable for use, force creation of tables " .
+        "by setting USE_UNSAFE_MYSQL=1 in your environment and run this " .
+        "command again.";
+
+    my $engines = eval { $dbh->selectall_hashref("SHOW ENGINES", "Engine"); };
+    delete $self->{_zkh};
+    if ($@ && $dbh->err == 1064) {
+        # syntax error?  for MySQL 4.0.x.
+        # who cares.  we'll catch it below on the double-check.
+    } elsif ($engines->{ndbcluster} and
+               $engines->{ndbcluster}->{Support} =~ m/^(YES|DEFAULT)$/i) {
+        $dbh->do("SET storage_engine=NDBCLUSTER");
+        # setup Net::Zookeeper::Lock
+        $self->{_zkh} = eval {
+            require Net::ZooKeeper::Lock;
+            Net::ZooKeeper::Lock->import();
+            Net::ZooKeeper->new('localhost:2181');
+        };
+        if ($@) {
+            die "Cannot get Zookeeper handle for MySQL Cluster locking. $@\n";
+        }
+    } else {
+        $dbh->do("SET storage_engine=InnoDB");
+        unless ($ENV{USE_UNSAFE_MYSQL}){
+            die $errmsg unless ($engines->{InnoDB} and
+                                $engines->{InnoDB}->{Support} =~ m/^(YES|DEFAULT)$/i);
+        }
+    }
 }
 
 sub was_deadlock_error {
@@ -111,7 +143,25 @@ sub get_lock {
     my ($self, $lockname, $timeout) = @_;
     die "Lock recursion detected (grabbing $lockname, had $self->{last_lock}).  Bailing out." if $self->{lock_depth};
 
-    my $lock = $self->dbh->selectrow_array("SELECT GET_LOCK(?, ?)", undef, $lockname, $timeout);
+    my $lock;
+    if (exists $self->{_zkh}) {
+        $lock = eval {
+            $self->{__lock_obj}->{$lockname} =
+                Net::ZooKeeper::Lock->new({
+                                           zkh       => $self->{_zkh},
+                                           lock_name => $lockname,
+                                           timeout   => $timeout,
+                                          });
+        };
+        if ($@) {
+            # If error occured, reget Zookeeper object
+            $self->{_zkh} = eval {
+                Net::ZooKeeper->new('localhost:2181');
+            };
+        }
+    } else {
+        $lock = $self->dbh->selectrow_array("SELECT GET_LOCK(?, ?)", undef, $lockname, $timeout);
+    }
     if ($lock) {
         $self->{lock_depth} = 1;
         $self->{last_lock}  = $lockname;
@@ -123,9 +173,25 @@ sub get_lock {
 # returns 1 on success and 0 if no lock we have has that name.
 sub release_lock {
     my ($self, $lockname) = @_;
-    my $rv = $self->dbh->selectrow_array("SELECT RELEASE_LOCK(?)", undef, $lockname);
+    my $ret;
+    if (exists $self->{_zkh}) {
+        $ret = eval {
+            $self->{__lock_obj}->{$lockname}->unlock();
+            1;
+        };
+        if ($@) {
+            # If error occured, reget Zookeeper object
+            $self->{_zkh} = eval {
+                Net::ZooKeeper->new('localhost:2181');
+            };
+            $ret = 0;
+        }
+        delete $self->{__lock_obj}->{$lockname};
+    } else {
+        $ret = $self->dbh->selectrow_array("SELECT RELEASE_LOCK(?)", undef, $lockname);
+    }
     $self->{lock_depth} = 0;
-    return $rv;
+    return $ret;
 }
 
 sub lock_queue {
@@ -264,36 +330,17 @@ sub create_table {
         "by setting USE_UNSAFE_MYSQL=1 in your environment and run this " .
         "command again.";
 
-    unless ($ENV{USE_UNSAFE_MYSQL}) {
-        my $engines = eval { $dbh->selectall_hashref("SHOW ENGINES", "Engine"); };
-        if ($@ && $dbh->err == 1064) {
-            # syntax error?  for MySQL 4.0.x.
-            # who cares.  we'll catch it below on the double-check.
-        } else {
-            die $errmsg
-                unless ($engines->{InnoDB} and
-                        $engines->{InnoDB}->{Support} =~ m/^(YES|DEFAULT)$/i);
-        }
-    }
-
     my $existed = $self->table_exists($table);
 
     $self->SUPER::create_table(@_);
     return if $ENV{USE_UNSAFE_MYSQL};
 
-    # don't alter an existing table up to InnoDB from MyISAM...
-    # could be costly.  but on new tables, no problem...
-    unless ($existed) {
-        $dbh->do("ALTER TABLE $table ENGINE=InnoDB");
-        warn "DBI reported an error of: '" . $dbh->errstr . "' when trying to " .
-            "alter table type of $table to InnoDB\n" if $dbh->err;
-    }
-
     # but in any case, let's see if it's already InnoDB or not.
     my $table_status = $dbh->selectrow_hashref("SHOW TABLE STATUS LIKE '$table'");
 
     # if not, either die or warn.
-    unless (($table_status->{Engine} || $table_status->{Type} || "") eq "InnoDB") {
+    unless ((exists $self->{_zkh} and ($table_status->{Engine} || $table_status->{Type} || "") eq "ndbcluster") or
+            (not exists $self->{_zkh} and ($table_status->{Engine} || $table_status->{Type} || "") eq "InnoDB")) {
         if ($existed) {
             warn "WARNING: MySQL table that isn't InnoDB: $table\n";
         } else {
